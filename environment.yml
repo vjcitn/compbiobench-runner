@@ -49,8 +49,9 @@ dependencies:
   - subread  # provides featureCounts
 
   # Hi-C / 3D Genomics
+  # cooltools omitted: its only available build pins numpy<2.0, which conflicts
+  # with cyvcf2 (requires numpy>=2.1); cooler alone covers .cool file I/O
   - cooler
-  - cooltools
 
   # File Format Utilities
   - htslib
