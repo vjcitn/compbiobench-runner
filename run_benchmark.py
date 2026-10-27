@@ -961,6 +961,9 @@ class PiProvider(LLMProvider):
     # Local Ollama models are free. (input_usd_per_1m, output_usd_per_1m)
     model_pricing = {
         "ollama/gpt-oss:20b": (0.0, 0.0),
+        # unsloth/Qwen3.6-35B-A3B-GGUF, built into a local Ollama tag via a
+        # Modelfile (`FROM ./<quant>.gguf`) on the target machine.
+        "ollama/qwen3.6-35b-a3b": (0.0, 0.0),
     }
 
     def build_test_command(self, model: str) -> list[str]:
