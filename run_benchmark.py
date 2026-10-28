@@ -944,11 +944,15 @@ class GeminiProvider(LLMProvider):
 
 class PiProvider(LLMProvider):
     """Pi coding agent CLI provider (`@earendil-works/pi-coding-agent`), configured
-    against a local model served by Ollama (e.g. gpt-oss:20b).
+    against a locally-served model (e.g. gpt-oss:20b via Ollama, or
+    Qwen3.6-35B-A3B via llama.cpp's llama-server). The backend is selected
+    entirely by the `model` string (its "<provider>/<id>" prefix) and the
+    corresponding entry in Pi's own `~/.pi/agent/models.json` -- this class has
+    no backend-specific logic.
 
     Pi is a Node.js CLI, not part of the `compbio-benchmark` conda stack, and is
     installed per-user (e.g. `~/.local/bin/pi`) rather than cloned per question;
-    see `uses_conda_env` below. A local Ollama model has no catalog price, so
+    see `uses_conda_env` below. Locally-served models have no catalog price, so
     cost is always $0 -- only token counts are meaningful here.
     """
 
@@ -1047,7 +1051,7 @@ class PiProvider(LLMProvider):
         usage["cache_creation_tokens"] = total_cache_write
         usage["reported_cost_usd"] = total_cost
 
-        # Local Ollama models have no catalog price; this is always $0 given
+        # Locally-served models have no catalog price; this is always $0 given
         # model_pricing above, kept for consistency with the other providers.
         usage["estimated_cost_usd"] = self.calculate_cost(usage["input_tokens"], usage["output_tokens"], model)
         usage["cost_usd"] = usage["reported_cost_usd"] or usage["estimated_cost_usd"]
