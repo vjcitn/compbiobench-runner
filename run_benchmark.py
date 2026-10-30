@@ -292,6 +292,9 @@ class LLMProvider(ABC):
     default_model: str = ""
     conda_env: str = ""
     install_url: str = ""
+    # Whether run_question() should clone/use a per-question conda env for this
+    # provider. False for providers whose CLI lives outside conda entirely.
+    uses_conda_env: bool = True
 
     # Model pricing: provider-specific model pricing maps.
     model_pricing: dict[str, object] = {}
@@ -939,11 +942,156 @@ class GeminiProvider(LLMProvider):
         raise NotImplementedError("answer extraction not implemented for gemini")
 
 
+class PiProvider(LLMProvider):
+    """Pi coding agent CLI provider (`@earendil-works/pi-coding-agent`), configured
+    against a locally-served model (e.g. gpt-oss:20b via Ollama, or
+    Qwen3.6-35B-A3B via llama.cpp's llama-server). The backend is selected
+    entirely by the `model` string (its "<provider>/<id>" prefix) and the
+    corresponding entry in Pi's own `~/.pi/agent/models.json` -- this class has
+    no backend-specific logic.
+
+    Pi is a Node.js CLI, not part of the `compbio-benchmark` conda stack, and is
+    installed per-user (e.g. `~/.local/bin/pi`) rather than cloned per question;
+    see `uses_conda_env` below. Locally-served models have no catalog price, so
+    cost is always $0 -- only token counts are meaningful here.
+    """
+
+    name = "pi"
+    default_model = "ollama/gpt-oss:20b"
+    conda_env = ""
+    install_url = "https://pi.dev"
+    uses_conda_env = False
+
+    # Local models are free. (input_usd_per_1m, output_usd_per_1m)
+    model_pricing = {
+        "ollama/gpt-oss:20b": (0.0, 0.0),
+        # unsloth/Qwen3.6-35B-A3B-GGUF served by llama.cpp's llama-server
+        # (t4-coder.sh), exposed to Pi as provider "llama-cpp" with model id
+        # ALIAS (default "qwen3.6-35b-a3b") -- see ~/.pi/agent/models.json.
+        "llama-cpp/qwen3.6-35b-a3b": (0.0, 0.0),
+    }
+
+    def build_test_command(self, model: str) -> list[str]:
+        """Build a minimal test command to verify model availability."""
+        return ["pi", "--mode", "json", "--model", model, "--no-session", "--print",
+                "Reply with only the word OK"]
+
+    def build_command(self, model: str, prompt: str, data_dir: str | None = None, permission_mode: str = "skip",
+            workspace_dir: str = None, answer_output_path: str | None = None) -> list[str]:
+        # Pi has no built-in tool-call approval gate (so no --permission-mode
+        # equivalent is needed) and no --add-dir equivalent: filesystem/tool
+        # scope is just the process's cwd, which execute_llm_process() already
+        # sets to workspace_dir.
+        return ["pi", "--mode", "json", "--model", model, "--no-session", "--print", prompt]
+
+    def parse_output(self, stdout: str, model: str) -> tuple[str, dict]:
+        """Parse Pi's `--mode json` JSONL event stream.
+
+        Builds a trace from tool executions and assistant thinking/text blocks,
+        and reads final token usage from the last assistant `message_end` event
+        (Pi attaches cumulative `usage` directly to that message).
+        """
+        usage = init_usage_dict(model)
+        trace_parts = []
+        # Pi's per-assistant-message `usage` is the cumulative usage of that one
+        # streamed response, not of the whole (possibly multi-turn) session --
+        # a question that takes several tool-call turns gets several small
+        # per-turn usage blocks, so totals must be summed across every
+        # assistant `message_end`, not read off only the last one.
+        total_input = total_output = total_cache_read = total_cache_write = 0
+        total_cost = 0.0
+
+        for event, line in parse_jsonl_events(stdout):
+            event_type = event.get("type", "")
+
+            if event_type == "raw":
+                trace_parts.append(event["content"])
+
+            elif event_type == "tool_execution_start":
+                tool_name = event.get("toolName", "unknown")
+                tool_args = event.get("args", {}) or {}
+                if tool_name == "bash":
+                    trace_parts.append(format_bash_tool(tool_args.get("command", "")))
+                elif tool_name in ("read", "write", "edit"):
+                    trace_parts.append(format_tool_call(tool_name.capitalize(), tool_args.get("path", "")))
+                else:
+                    trace_parts.append(format_tool_call(tool_name))
+
+            elif event_type == "tool_execution_end":
+                result = event.get("result", {}) or {}
+                content = result.get("content", []) if isinstance(result, dict) else []
+                text_parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                result_text = format_tool_result("\n".join(text_parts))
+                if result_text:
+                    trace_parts.append(result_text)
+
+            elif event_type == "message_end":
+                message = event.get("message", {})
+                if message.get("role") != "assistant":
+                    continue
+                for block in message.get("content", []):
+                    if block.get("type") == "thinking":
+                        msg = format_assistant_message("Pi", block.get("thinking", ""), thinking=True)
+                        if msg:
+                            trace_parts.append(msg)
+                    elif block.get("type") == "text":
+                        msg = format_assistant_message("Pi", block.get("text", ""))
+                        if msg:
+                            trace_parts.append(msg)
+                turn_usage = message.get("usage") or {}
+                total_input += turn_usage.get("input", 0) or 0
+                total_output += turn_usage.get("output", 0) or 0
+                total_cache_read += turn_usage.get("cacheRead", 0) or 0
+                total_cache_write += turn_usage.get("cacheWrite", 0) or 0
+                total_cost += (turn_usage.get("cost") or {}).get("total", 0.0) or 0.0
+
+        usage["input_tokens"] = total_input
+        usage["output_tokens"] = total_output
+        usage["cache_read_tokens"] = total_cache_read
+        usage["cache_creation_tokens"] = total_cache_write
+        usage["reported_cost_usd"] = total_cost
+
+        # Locally-served models have no catalog price; this is always $0 given
+        # model_pricing above, kept for consistency with the other providers.
+        usage["estimated_cost_usd"] = self.calculate_cost(usage["input_tokens"], usage["output_tokens"], model)
+        usage["cost_usd"] = usage["reported_cost_usd"] or usage["estimated_cost_usd"]
+        usage["models"] = [{
+            "model": model,
+            "inputTokens": usage["input_tokens"],
+            "outputTokens": usage["output_tokens"],
+            "costUSD": usage["cost_usd"],
+        }]
+
+        return build_trace_text(trace_parts, stdout), usage
+
+    def extract_answer(self, stdout: str, model: str, answer_output_path: str | None = None) -> str:
+        """Extract the final answer from Pi's last assistant `message_end` text block."""
+        final_text = ""
+        saw_assistant_message = False
+        for event, _ in parse_jsonl_events(stdout):
+            if event.get("type") != "message_end":
+                continue
+            message = event.get("message", {})
+            if message.get("role") != "assistant":
+                continue
+            saw_assistant_message = True
+            text_blocks = [
+                b.get("text", "") for b in message.get("content", [])
+                if isinstance(b, dict) and b.get("type") == "text"
+            ]
+            if text_blocks:
+                final_text = "\n".join(text_blocks)
+        if not saw_assistant_message:
+            return "ERROR: no assistant message_end event"
+        return parse_answer(extract_last_non_empty_line(final_text))
+
+
 # Provider registry
 LLM_PROVIDERS: dict[str, LLMProvider] = {
     "claude": ClaudeProvider(),
     "codex": CodexProvider(),
     "gemini": GeminiProvider(),
+    "pi": PiProvider(),
 }
 
 
@@ -1617,28 +1765,31 @@ def run_question(idx: int, row: pd.Series, llm: str, model: str, timeout_seconds
 
     logger.debug(f"{'='*80}\nSTARTING: {question_id} | Index: {idx}\n{'='*80}")
 
-    # Clone conda environment for this question (use UUID suffix for uniqueness in parallel runs)
-    conda_env = f"benchmark_{llm}_{safe_qid}_{uuid.uuid4().hex[:8]}"
-    # Register for cleanup on shutdown
-    register_conda_env(conda_env)
-    if not clone_conda_env(conda_env, logger):
-        logger.error(f"[{question_id}] Failed to clone conda environment")
-        # Record failure and return
-        answer = "ERROR: conda clone failed"
-        usage = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "model": model}
-        save_trace_md(trace_path, question_id, llm, model, run_timestamp, 0.0, None,
-                      answer, "", usage, "conda clone failed")
-        save_raw_output_files(raw_stdout_path, raw_stderr_path, "", "conda clone failed")
-        save_result_json(result_path, raw_stdout_path, raw_stderr_path,
-                         idx, question_id, question, file_paths, difficulty, prompt,
-                         llm, model, llm_version, run_timestamp, None, answer, 0.0, usage, "",
-                         model_reasoning_effort=model_reasoning_effort)
-        with progress_state['lock']:
-            progress_state['completed'] += 1
-            progress_state['errors'] += 1
-            logger.info(f"[{progress_state['completed']:3d}/{progress_state['total']}] "
-                        f"{question_id[:30]:<30} | D:{difficulty:<3} |     0s |    $0.00 | [ERR] conda clone failed")
-        return idx, answer, 0.0
+    # Clone conda environment for this question (use UUID suffix for uniqueness in parallel runs),
+    # unless this provider's CLI lives outside the conda stack entirely (e.g. Pi).
+    conda_env = None
+    if get_provider(llm).uses_conda_env:
+        conda_env = f"benchmark_{llm}_{safe_qid}_{uuid.uuid4().hex[:8]}"
+        # Register for cleanup on shutdown
+        register_conda_env(conda_env)
+        if not clone_conda_env(conda_env, logger):
+            logger.error(f"[{question_id}] Failed to clone conda environment")
+            # Record failure and return
+            answer = "ERROR: conda clone failed"
+            usage = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "model": model}
+            save_trace_md(trace_path, question_id, llm, model, run_timestamp, 0.0, None,
+                          answer, "", usage, "conda clone failed")
+            save_raw_output_files(raw_stdout_path, raw_stderr_path, "", "conda clone failed")
+            save_result_json(result_path, raw_stdout_path, raw_stderr_path,
+                             idx, question_id, question, file_paths, difficulty, prompt,
+                             llm, model, llm_version, run_timestamp, None, answer, 0.0, usage, "",
+                             model_reasoning_effort=model_reasoning_effort)
+            with progress_state['lock']:
+                progress_state['completed'] += 1
+                progress_state['errors'] += 1
+                logger.info(f"[{progress_state['completed']:3d}/{progress_state['total']}] "
+                            f"{question_id[:30]:<30} | D:{difficulty:<3} |     0s |    $0.00 | [ERR] conda clone failed")
+            return idx, answer, 0.0
 
     stdout, stderr, return_code, elapsed_time = "", "", None, 0.0
     usage = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "model": model}
